@@ -1,0 +1,6 @@
+Django>=4.2,<5
+python-dotenv>=1.0
+djangorestframework>=3.14
+django-cors-headers>=4.3
+paramiko>=3.4
+scp>=0.14

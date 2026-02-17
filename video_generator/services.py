@@ -5,7 +5,6 @@ import base64
 import logging
 import os
 import subprocess
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +14,8 @@ from scp import SCPClient
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
+
+NOTIFY_LOG = getattr(settings, 'NOTIFY_LOG_PATH', '/tmp/shortplay_notify.log')
 
 
 def _escape_shell_arg(s: str) -> str:
@@ -134,15 +135,15 @@ class RemoteVideoGeneratorService:
     def _build_command_safe(self, task_id: str, **kwargs) -> str:
         """
         使用更安全的参数拼接方式（单引号包裹，避免特殊字符问题）
+        reference_to_video: 仅用 images(->ref_imgs)
+        single_shot_extension: 仅用 input_video
         """
         model_id = kwargs.get('model_id') or settings.REMOTE_MODEL_ID
         task_type = kwargs.get('task_type', 'reference_to_video')
-        ref_imgs = kwargs.get('ref_imgs', '')
         prompt = kwargs.get('prompt', '')
         duration = kwargs.get('duration', 5)
         offload = kwargs.get('offload', True)
 
-        # 直接使用 env 下的 python 绝对路径，无需 conda activate
         env_setup = (
             "source /etc/network_turbo && "
             f"cd {settings.REMOTE_WORK_DIR} && "
@@ -159,36 +160,43 @@ class RemoteVideoGeneratorService:
             f"--duration {duration}",
             f"--output_file '{task_id}.mp4'",
         ]
-        if ref_imgs:
-            args.append(f"--ref_imgs '{_escape_shell_arg(ref_imgs)}'")
+        if task_type == 'reference_to_video':
+            ref_imgs = kwargs.get('ref_imgs', '')
+            if ref_imgs:
+                args.append(f"--ref_imgs '{_escape_shell_arg(ref_imgs)}'")
+        elif task_type == 'single_shot_extension':
+            input_video = kwargs.get('input_video', '')
+            if input_video:
+                args.append(f"--input_video '{_escape_shell_arg(input_video)}'")
         if offload:
             args.append("--offload")
 
-        return env_setup + f"{settings.REMOTE_WORK_DIR}/env/bin/python generate_video.py " + " ".join(args)
+        python_cmd = env_setup + f"{settings.REMOTE_WORK_DIR}/env/bin/python generate_video.py " + " ".join(args)
+        notify_cmd = f" && echo '[NOTIFY] video_create_done taskId={task_id}' >> {NOTIFY_LOG}"
+        return python_cmd + notify_cmd
 
-    def generate_video(self, **kwargs) -> dict:
+    def create_video(self, task_id: str, **kwargs) -> dict:
         """
-        提交视频生成任务，后台执行脚本，立即返回流水号
+        提交视频生成任务，后台执行脚本，立即返回
         返回: {"success": bool, "task_id": str|None, "message": str}
         """
-        task_id = uuid.uuid4().hex
         try:
             cmd = self._build_command_safe(task_id, **kwargs)
             log_file = f"/tmp/skyreels_{task_id}.log"
 
             if self._use_remote_ssh():
-                return self._submit_via_ssh(task_id, cmd, log_file)
-            return self._submit_local(task_id, cmd, log_file)
+                return self._submit_via_ssh(task_id, cmd, log_file, "create")
+            return self._submit_local(task_id, cmd, log_file, "create")
 
         except Exception as e:
             logger.exception("视频生成异常: %s", e)
             return {
                 "success": False,
-                "task_id": None,
+                "task_id": task_id,
                 "message": str(e),
             }
 
-    def _submit_via_ssh(self, task_id: str, cmd: str, log_file: str) -> dict:
+    def _submit_via_ssh(self, task_id: str, cmd: str, log_file: str, _context: str = "") -> dict:
         """通过 SSH 在远程执行"""
         client = self._get_ssh_client()
         cmd_b64 = base64.b64encode(cmd.encode("utf-8")).decode("ascii")
@@ -204,7 +212,7 @@ class RemoteVideoGeneratorService:
             return {"success": False, "task_id": None, "message": f"提交任务失败 (exit_code={exit_status}): {err_msg or '(无输出)'}"}
         return {"success": True, "task_id": task_id, "message": "任务已提交，正在后台执行"}
 
-    def _submit_local(self, task_id: str, cmd: str, log_file: str) -> dict:
+    def _submit_local(self, task_id: str, cmd: str, log_file: str, _context: str = "") -> dict:
         """本机直接执行（subprocess 后台，cmd 内已包含 source/export）"""
         logger.info("提交视频生成任务 task_id=%s (本机)", task_id)
         with open(log_file, 'w') as f:

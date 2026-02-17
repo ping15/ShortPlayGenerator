@@ -4,3 +4,4 @@ djangorestframework>=3.14
 django-cors-headers>=4.3
 paramiko>=3.4
 scp>=0.14
+requests>=2.28

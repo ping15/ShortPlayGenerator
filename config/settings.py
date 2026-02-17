@@ -112,5 +112,23 @@ REMOTE_MODEL_ID = os.environ.get('REMOTE_MODEL_ID', '/root/autodl-tmp/SkyReels-V
 # 本地生成视频存储目录
 GENERATED_VIDEOS_DIR = BASE_DIR / 'generated_videos'
 
+# 视频生成/延伸：脚本读取的输入资源路径（远程或本机执行时）
+# local: 解析为 file:// 时使用此路径，默认 /home/test_assets
+REMOTE_TEST_ASSETS_DIR = os.environ.get('REMOTE_TEST_ASSETS_DIR', '/home/test_assets')
+
+# 视频合成：Django 本机读取的输入资源路径
+# local: 解析为 file:// 时使用此路径，默认当前项目 test_assets（跨 Windows/Linux）
+MERGE_TEST_ASSETS_DIR = os.environ.get('MERGE_TEST_ASSETS_DIR') or (BASE_DIR / 'test_assets')
+
 # 启动时是否跳过远程 SSH 初始化（USE_REMOTE_SSH=True 且网络不可达时可设为 true）
 SKIP_SSH_INIT_ON_STARTUP = os.environ.get('SKIP_SSH_INIT_ON_STARTUP', 'false').lower() in ('true', '1', 'yes')
+
+# 通知日志路径（merge/create 完成时追加），默认 test_assets/logs/（跨 Windows/Linux）
+NOTIFY_LOG_PATH = os.environ.get('NOTIFY_LOG_PATH') or str(BASE_DIR / 'test_assets' / 'logs' / 'shortplay_notify.log')
+
+# OSS 配置（配置环境变量后使用）
+OSS_ENDPOINT = os.environ.get('OSS_ENDPOINT', '')
+OSS_ACCESS_KEY_ID = os.environ.get('OSS_ACCESS_KEY_ID', '')
+OSS_ACCESS_KEY_SECRET = os.environ.get('OSS_ACCESS_KEY_SECRET', '')
+OSS_BUCKET_NAME = os.environ.get('OSS_BUCKET_NAME', '')
+OSS_REGION = os.environ.get('OSS_REGION', '')

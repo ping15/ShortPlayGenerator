@@ -1,9 +1,12 @@
 """
-视频生成 API 路由
+视频 API 路由
 """
 from django.urls import path
-from .views import GenerateVideoView
+from .views import CreateVideoView, MergeVideoView
 
 urlpatterns = [
-    path('generate-video/', GenerateVideoView.as_view(), name='generate-video'),
+    path('create/', CreateVideoView.as_view(), name='create'),
+    path('create', CreateVideoView.as_view(), name='create-no-slash'),
+    path('merge/', MergeVideoView.as_view(), name='merge'),
+    path('merge', MergeVideoView.as_view(), name='merge-no-slash'),
 ]

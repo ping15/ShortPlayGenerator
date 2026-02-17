@@ -5,3 +5,5 @@ db.sqlite3
 generated_videos/
 .env
 .idea/
+test_assets
+env.example

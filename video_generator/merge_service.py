@@ -63,13 +63,27 @@ def _merge_videos_sync(task_id: str, video_urls: list) -> None:
 
         if len(local_files) == 0:
             return
+        # 修复 moov atom 在末尾的 MP4（AI 生成/流式输出常见），避免 "moov atom not found"
+        fixed_files = []
+        for p in local_files:
+            fixed = tmp / f"{p.stem}_fixed{p.suffix}"
+            r = subprocess.run(
+                ['ffmpeg', '-y', '-i', str(p), '-c', 'copy', '-movflags', '+faststart', str(fixed)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if r.returncode == 0:
+                fixed_files.append(fixed)
+            else:
+                fixed_files.append(p)
         if len(local_files) == 1:
             import shutil
-            shutil.copy(local_files[0], out_path)
+            shutil.copy(fixed_files[0], out_path)
         else:
             concat_file = tmp / "concat.txt"
             with open(concat_file, 'w') as f:
-                for p in local_files:
+                for p in fixed_files:
                     f.write(f"file '{p.absolute()}'\n")
             result = subprocess.run(
                 ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', str(concat_file), '-c', 'copy', str(out_path)],

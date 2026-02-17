@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import subprocess
+import traceback
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
 from threading import Lock, Thread
@@ -78,6 +80,22 @@ def _persist_load() -> list:
 
 
 _persist_lock = Lock()
+
+
+def _write_failed_log(task_id: str, reason: str, extra: str = "") -> None:
+    """生成失败时写入 test_assets/logs/{task_id}_failed.log"""
+    try:
+        base = getattr(settings, 'BASE_DIR', Path(__file__).resolve().parent.parent)
+        path = base / 'test_assets' / 'logs' / f'{task_id}_failed.log'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(f"[{datetime.now().isoformat()}] task_id={task_id} 生成失败\n")
+            f.write(f"原因: {reason}\n")
+            if extra:
+                f.write("\n--- 详细日志 ---\n")
+                f.write(extra)
+    except Exception as e:
+        logger.exception("写入失败日志异常 task_id=%s: %s", task_id, e)
 
 
 def _escape_shell_arg(s: str) -> str:
@@ -257,7 +275,32 @@ class RemoteVideoGeneratorService:
                 "message": str(e),
             }
 
-    def _run_via_ssh_sync(self, task_id: str, cmd: str, log_file: str) -> None:
+    def _get_result_dir(self, task_type: str) -> str:
+        """按 task_type 获取结果目录"""
+        if task_type == 'single_shot_extension':
+            return getattr(settings, 'REMOTE_RESULT_DIR_SINGLE_SHOT_EXTENSION', '')
+        return getattr(settings, 'REMOTE_RESULT_DIR_REFERENCE_TO_VIDEO', '')
+
+    def _check_mp4_exists_ssh(self, client, task_id: str, task_type: str) -> bool:
+        """远程模式：检查 taskId.mp4 是否存在"""
+        result_dir = self._get_result_dir(task_type)
+        if not result_dir:
+            return True
+        mp4_path = f"{result_dir.rstrip('/')}/{task_id}.mp4"
+        try:
+            stdin, stdout, _ = client.exec_command(f"test -f {repr(mp4_path)} && echo ok", timeout=5)
+            return stdout.read().decode().strip() == 'ok'
+        except Exception:
+            return False
+
+    def _check_mp4_exists_local(self, task_id: str, task_type: str) -> bool:
+        """本机模式：检查 taskId.mp4 是否存在"""
+        result_dir = self._get_result_dir(task_type)
+        if not result_dir:
+            return True
+        return (Path(result_dir) / f"{task_id}.mp4").exists()
+
+    def _run_via_ssh_sync(self, task_id: str, cmd: str, log_file: str, task_type: str = 'reference_to_video') -> None:
         """同步执行：远程运行命令并等待完成（队列 worker 用）"""
         client = self._get_ssh_client()
         cmd_b64 = base64.b64encode(cmd.encode("utf-8")).decode("ascii")
@@ -268,10 +311,24 @@ class RemoteVideoGeneratorService:
         exit_status = stdout.channel.recv_exit_status()
         if exit_status != 0:
             logger.warning("视频生成 task_id=%s 退出码: %s", task_id, exit_status)
+            extra = ""
+            try:
+                tail_cmd = f"tail -200 {log_file} 2>/dev/null || cat {log_file} 2>/dev/null"
+                stdin2, stdout2, _ = client.exec_command(tail_cmd, timeout=10)
+                extra = stdout2.read().decode(errors='replace')
+            except Exception:
+                pass
+            _write_failed_log(task_id, f"远程脚本退出码 {exit_status}", extra)
+        elif not self._check_mp4_exists_ssh(client, task_id, task_type):
+            _write_failed_log(
+                task_id,
+                f"脚本退出码 0 但未找到 {task_id}.mp4（路径: {self._get_result_dir(task_type)}）",
+                "请检查 generate_video.py 的输出目录配置",
+            )
         else:
             logger.info("视频生成完成 task_id=%s", task_id)
 
-    def _run_local_sync(self, task_id: str, cmd: str, log_file: str) -> None:
+    def _run_local_sync(self, task_id: str, cmd: str, log_file: str, task_type: str = 'reference_to_video') -> None:
         """同步执行：本机运行命令并等待完成（队列 worker 用）"""
         logger.info("开始执行视频生成 task_id=%s (本机)", task_id)
         with open(log_file, 'w') as f:
@@ -284,6 +341,22 @@ class RemoteVideoGeneratorService:
             )
         if result.returncode != 0:
             logger.warning("视频生成 task_id=%s 退出码: %s", task_id, result.returncode)
+            extra = ""
+            try:
+                p = Path(log_file)
+                if p.exists():
+                    with open(p, 'r', encoding='utf-8', errors='replace') as rf:
+                        content = rf.read()
+                        extra = content[-20000:]
+            except Exception:
+                pass
+            _write_failed_log(task_id, f"本机脚本退出码 {result.returncode}", extra)
+        elif not self._check_mp4_exists_local(task_id, task_type):
+            _write_failed_log(
+                task_id,
+                f"脚本退出码 0 但未找到 {task_id}.mp4（路径: {self._get_result_dir(task_type)}）",
+                "请检查 generate_video.py 的输出目录配置",
+            )
         else:
             logger.info("视频生成完成 task_id=%s", task_id)
 
@@ -392,14 +465,16 @@ def _video_gen_worker():
             break
         task_id, kwargs = item
         try:
+            task_type = kwargs.get('task_type', 'reference_to_video')
             cmd = video_generator_service._build_command_safe(task_id, **kwargs)
             log_file = f"/tmp/skyreels_{task_id}.log"
             if video_generator_service._use_remote_ssh():
-                video_generator_service._run_via_ssh_sync(task_id, cmd, log_file)
+                video_generator_service._run_via_ssh_sync(task_id, cmd, log_file, task_type)
             else:
-                video_generator_service._run_local_sync(task_id, cmd, log_file)
+                video_generator_service._run_local_sync(task_id, cmd, log_file, task_type)
         except Exception as e:
             logger.exception("视频生成任务异常 task_id=%s: %s", task_id, e)
+            _write_failed_log(task_id, f"异常: {e}", traceback.format_exc())
         finally:
             _persist_remove(task_id)
             _video_gen_queue.task_done()

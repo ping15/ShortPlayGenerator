@@ -109,6 +109,14 @@ REMOTE_SSH_PASSWORD = os.environ.get('REMOTE_SSH_PASSWORD', '')
 REMOTE_WORK_DIR = os.environ.get('REMOTE_WORK_DIR', '/root/autodl-tmp/SkyReels-V3')
 REMOTE_MODEL_ID = os.environ.get('REMOTE_MODEL_ID', '/root/autodl-tmp/SkyReels-V3-R2V-14B')
 
+# 远程生成视频结果目录（按 task_type，校验 taskId.mp4 是否存在）
+REMOTE_RESULT_DIR_REFERENCE_TO_VIDEO = os.environ.get(
+    'REMOTE_RESULT_DIR_REFERENCE_TO_VIDEO', f'{REMOTE_WORK_DIR}/result/reference_to_video',
+)
+REMOTE_RESULT_DIR_SINGLE_SHOT_EXTENSION = os.environ.get(
+    'REMOTE_RESULT_DIR_SINGLE_SHOT_EXTENSION', f'{REMOTE_WORK_DIR}/result/single_shot_extension',
+)
+
 # 本地生成视频存储目录
 GENERATED_VIDEOS_DIR = BASE_DIR / 'generated_videos'
 

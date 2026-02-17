@@ -1,11 +1,14 @@
 """
-视频生成服务：支持远程 SSH 执行或本机直接执行
+视频生成服务：支持远程 SSH 执行或本机直接执行，单卡串行队列，文件持久化
 """
 import base64
+import json
 import logging
 import os
 import subprocess
 from pathlib import Path
+from queue import Queue
+from threading import Lock, Thread
 from typing import Optional
 
 import paramiko
@@ -16,6 +19,65 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 NOTIFY_LOG = getattr(settings, 'NOTIFY_LOG_PATH', '/tmp/shortplay_notify.log')
+
+
+def _get_queue_file_path() -> Path:
+    """队列持久化文件路径：test_assets/logs/video_gen_queue.jsonl"""
+    base = getattr(settings, 'BASE_DIR', Path(__file__).resolve().parent.parent)
+    p = base / 'test_assets' / 'logs' / 'video_gen_queue.jsonl'
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _persist_append(task_id: str, kwargs: dict) -> None:
+    """任务入队时追加到文件"""
+    with _persist_lock:
+        with open(_get_queue_file_path(), 'a', encoding='utf-8') as f:
+            f.write(json.dumps({'task_id': task_id, 'kwargs': kwargs}, ensure_ascii=False) + '\n')
+
+
+def _persist_remove(task_id: str) -> None:
+    """任务完成后从文件移除"""
+    with _persist_lock:
+        path = _get_queue_file_path()
+        if not path.exists():
+            return
+        lines = []
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if obj.get('task_id') != task_id:
+                        lines.append(line)
+                except json.JSONDecodeError:
+                    continue
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + ('\n' if lines else ''))
+
+
+def _persist_load() -> list:
+    """启动时加载未完成任务"""
+    path = _get_queue_file_path()
+    if not path.exists():
+        return []
+    tasks = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                tasks.append((obj['task_id'], obj.get('kwargs', {})))
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return tasks
+
+
+_persist_lock = Lock()
 
 
 def _escape_shell_arg(s: str) -> str:
@@ -177,17 +239,16 @@ class RemoteVideoGeneratorService:
 
     def create_video(self, task_id: str, **kwargs) -> dict:
         """
-        提交视频生成任务，后台执行脚本，立即返回
+        提交视频生成任务到队列，立即返回；队列 worker 串行执行，单卡不并发
+        任务持久化到文件，关机重启后可恢复
         返回: {"success": bool, "task_id": str|None, "message": str}
         """
         try:
-            cmd = self._build_command_safe(task_id, **kwargs)
-            log_file = f"/tmp/skyreels_{task_id}.log"
-
-            if self._use_remote_ssh():
-                return self._submit_via_ssh(task_id, cmd, log_file, "create")
-            return self._submit_local(task_id, cmd, log_file, "create")
-
+            kw = dict(kwargs)
+            _persist_append(task_id, kw)
+            _video_gen_queue.put((task_id, kw))
+            logger.info("视频生成任务已入队 task_id=%s (队列等待中)", task_id)
+            return {"success": True, "task_id": task_id, "message": "任务已入队，正在排队执行"}
         except Exception as e:
             logger.exception("视频生成异常: %s", e)
             return {
@@ -195,6 +256,36 @@ class RemoteVideoGeneratorService:
                 "task_id": task_id,
                 "message": str(e),
             }
+
+    def _run_via_ssh_sync(self, task_id: str, cmd: str, log_file: str) -> None:
+        """同步执行：远程运行命令并等待完成（队列 worker 用）"""
+        client = self._get_ssh_client()
+        cmd_b64 = base64.b64encode(cmd.encode("utf-8")).decode("ascii")
+        sync_cmd = f"bash -c 'eval \"$(echo {cmd_b64} | base64 -d)\"' > {log_file} 2>&1"
+        logger.info("开始执行视频生成 task_id=%s (远程)", task_id)
+        stdin, stdout, stderr = client.exec_command(sync_cmd, timeout=7200)
+        stdout.read()
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            logger.warning("视频生成 task_id=%s 退出码: %s", task_id, exit_status)
+        else:
+            logger.info("视频生成完成 task_id=%s", task_id)
+
+    def _run_local_sync(self, task_id: str, cmd: str, log_file: str) -> None:
+        """同步执行：本机运行命令并等待完成（队列 worker 用）"""
+        logger.info("开始执行视频生成 task_id=%s (本机)", task_id)
+        with open(log_file, 'w') as f:
+            result = subprocess.run(
+                ['bash', '-c', cmd],
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                cwd='/',
+                timeout=7200,
+            )
+        if result.returncode != 0:
+            logger.warning("视频生成 task_id=%s 退出码: %s", task_id, result.returncode)
+        else:
+            logger.info("视频生成完成 task_id=%s", task_id)
 
     def _submit_via_ssh(self, task_id: str, cmd: str, log_file: str, _context: str = "") -> dict:
         """通过 SSH 在远程执行"""
@@ -290,3 +381,33 @@ class RemoteVideoGeneratorService:
 
 # 单例服务实例
 video_generator_service = RemoteVideoGeneratorService()
+
+
+def _video_gen_worker():
+    """队列 worker：串行执行视频生成任务，单卡不并发"""
+    while True:
+        item = _video_gen_queue.get()
+        if item is None:
+            _video_gen_queue.task_done()
+            break
+        task_id, kwargs = item
+        try:
+            cmd = video_generator_service._build_command_safe(task_id, **kwargs)
+            log_file = f"/tmp/skyreels_{task_id}.log"
+            if video_generator_service._use_remote_ssh():
+                video_generator_service._run_via_ssh_sync(task_id, cmd, log_file)
+            else:
+                video_generator_service._run_local_sync(task_id, cmd, log_file)
+        except Exception as e:
+            logger.exception("视频生成任务异常 task_id=%s: %s", task_id, e)
+        finally:
+            _persist_remove(task_id)
+            _video_gen_queue.task_done()
+
+
+_video_gen_queue = Queue()
+for tid, kw in _persist_load():
+    _video_gen_queue.put((tid, kw))
+    logger.info("恢复未完成任务 task_id=%s", tid)
+_video_gen_worker_thread = Thread(target=_video_gen_worker, daemon=True)
+_video_gen_worker_thread.start()

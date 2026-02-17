@@ -64,11 +64,13 @@ def _merge_videos_sync(task_id: str, video_urls: list) -> None:
         if len(local_files) == 0:
             return
         # 修复 moov atom 在末尾的 MP4（AI 生成/流式输出常见），避免 "moov atom not found"
+        # 使用 -probesize/-analyzeduration 让 ffmpeg 读取更多数据以定位末尾的 moov
         fixed_files = []
         for p in local_files:
             fixed = tmp / f"{p.stem}_fixed{p.suffix}"
             r = subprocess.run(
-                ['ffmpeg', '-y', '-i', str(p), '-c', 'copy', '-movflags', '+faststart', str(fixed)],
+                ['ffmpeg', '-y', '-probesize', '100M', '-analyzeduration', '100M',
+                 '-i', str(p), '-c', 'copy', '-movflags', '+faststart', str(fixed)],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -76,7 +78,8 @@ def _merge_videos_sync(task_id: str, video_urls: list) -> None:
             if r.returncode == 0:
                 fixed_files.append(fixed)
             else:
-                fixed_files.append(p)
+                logger.error("ffmpeg 无法读取视频文件(可能损坏或 moov 在末尾): %s, stderr: %s", p, r.stderr[:500] if r.stderr else "")
+                return
         if len(local_files) == 1:
             import shutil
             shutil.copy(fixed_files[0], out_path)

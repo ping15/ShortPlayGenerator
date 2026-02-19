@@ -134,9 +134,20 @@ SKIP_SSH_INIT_ON_STARTUP = os.environ.get('SKIP_SSH_INIT_ON_STARTUP', 'false').l
 # 通知日志路径（merge/create 完成时追加），默认 test_assets/logs/（跨 Windows/Linux）
 NOTIFY_LOG_PATH = os.environ.get('NOTIFY_LOG_PATH') or str(BASE_DIR / 'test_assets' / 'logs' / 'shortplay_notify.log')
 
-# OSS 配置（配置环境变量后使用）
-OSS_ENDPOINT = os.environ.get('OSS_ENDPOINT', '')
-OSS_ACCESS_KEY_ID = os.environ.get('OSS_ACCESS_KEY_ID', '')
-OSS_ACCESS_KEY_SECRET = os.environ.get('OSS_ACCESS_KEY_SECRET', '')
-OSS_BUCKET_NAME = os.environ.get('OSS_BUCKET_NAME', '')
-OSS_REGION = os.environ.get('OSS_REGION', '')
+# 对象存储配置（腾讯云 COS，merge 完成后上传并记录 URL）
+# 使用 cos-python-sdk-v5，需配置 SecretId/SecretKey/Bucket/Region
+OSS_ACCESS_KEY_ID = os.environ.get('OSS_ACCESS_KEY_ID', '')      # 即 COS SecretId
+OSS_ACCESS_KEY_SECRET = os.environ.get('OSS_ACCESS_KEY_SECRET', '')  # 即 COS SecretKey
+OSS_BUCKET_NAME = os.environ.get('OSS_BUCKET_NAME', '')        # 如 aivideo-1382153705
+OSS_REGION = os.environ.get('OSS_REGION', 'ap-beijing')        # 如 ap-beijing
+# 合并视频 OSS 对象前缀，如 merged/
+OSS_MERGED_PREFIX = os.environ.get('OSS_MERGED_PREFIX', 'merged/')
+# 生成/延伸视频 OSS 对象前缀，如 generated/
+OSS_CREATE_PREFIX = os.environ.get('OSS_CREATE_PREFIX', 'generated/')
+# OSS 上传后 URL 记录日志（merge 与 create 各一份）
+OSS_URL_LOG_PATH = os.environ.get('OSS_URL_LOG_PATH') or str(BASE_DIR / 'test_assets' / 'logs' / 'merged_oss_urls.log')
+OSS_CREATE_URL_LOG_PATH = os.environ.get('OSS_CREATE_URL_LOG_PATH') or str(BASE_DIR / 'test_assets' / 'logs' / 'video_create_oss_urls.log')
+
+# 任务完成后的 HTTP 通知地址（POST JSON，有值则调用）
+MERGE_NOTIFY_URL = os.environ.get('MERGE_NOTIFY_URL', '')
+VIDEO_CREATE_NOTIFY_URL = os.environ.get('VIDEO_CREATE_NOTIFY_URL', '')

@@ -18,6 +18,8 @@ from scp import SCPClient
 
 from django.conf import settings
 
+from .notify_utils import call_notify
+
 logger = logging.getLogger(__name__)
 
 NOTIFY_LOG = getattr(settings, 'NOTIFY_LOG_PATH', '/tmp/shortplay_notify.log')
@@ -80,6 +82,54 @@ def _persist_load() -> list:
 
 
 _persist_lock = Lock()
+
+
+def _upload_video_to_cos_and_log(local_path: Path, task_id: str, prefix: str, log_path: str) -> str:
+    """上传视频到腾讯云 COS 并记录 URL 到日志，返回 oss_url（失败返回空串）"""
+    secret_id = getattr(settings, 'OSS_ACCESS_KEY_ID', '')
+    secret_key = getattr(settings, 'OSS_ACCESS_KEY_SECRET', '')
+    bucket_name = getattr(settings, 'OSS_BUCKET_NAME', '')
+    _r = (getattr(settings, 'OSS_REGION', '') or 'ap-beijing').strip()
+    region = ''.join(c for c in _r if c.isalnum() or c == '-') or 'ap-beijing'
+    if not all([secret_id, secret_key, bucket_name]) or not local_path.exists():
+        return ""
+    try:
+        from qcloud_cos import CosConfig, CosS3Client
+        config = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key)
+        client = CosS3Client(config)
+        object_key = f"{prefix.rstrip('/')}/{task_id}.mp4"
+        client.upload_file(
+            Bucket=bucket_name,
+            LocalFilePath=str(local_path),
+            Key=object_key,
+        )
+        oss_url = f"https://{bucket_name}.cos.{region}.myqcloud.com/{object_key}"
+        logger.info("视频生成 COS上传成功 task_id=%s url=%s", task_id, oss_url)
+        if log_path:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(f"[{datetime.now().isoformat()}] taskId={task_id} {oss_url}\n")
+        return oss_url
+    except Exception as e:
+        logger.exception("视频生成 COS上传失败 task_id=%s: %s", task_id, e)
+        return ""
+
+
+def _get_exit_code_desc(exit_code: int) -> str:
+    """常见退出码说明"""
+    if exit_code == 0:
+        return "正常结束"
+    if exit_code == 1:
+        return "一般错误（如参数错误、GPU OOM、模型加载失败、推理异常等）"
+    if exit_code == 137:
+        return "通常为内存不足被杀（OOM Killed）"
+    if exit_code == 139:
+        return "段错误（Segmentation fault），可能是显存溢出或驱动问题"
+    if exit_code == 143:
+        return "进程被 SIGTERM 终止"
+    if exit_code == -9:
+        return "进程被强制杀死（SIGKILL）"
+    return f"异常退出(exit={exit_code})"
 
 
 def _write_failed_log(task_id: str, reason: str, extra: str = "") -> None:
@@ -300,6 +350,23 @@ class RemoteVideoGeneratorService:
             return True
         return (Path(result_dir) / f"{task_id}.mp4").exists()
 
+    def _copy_task_mp4_from_remote(self, client, task_id: str, task_type: str) -> Optional[Path]:
+        """从远程拷贝 taskId.mp4 到本地 GENERATED_VIDEOS_DIR"""
+        result_dir = self._get_result_dir(task_type)
+        if not result_dir:
+            return None
+        remote_path = f"{result_dir.rstrip('/')}/{task_id}.mp4"
+        local_base = Path(settings.GENERATED_VIDEOS_DIR)
+        local_base.mkdir(parents=True, exist_ok=True)
+        local_path = local_base / f"{task_id}.mp4"
+        try:
+            with SCPClient(client.get_transport()) as scp:
+                scp.get(remote_path, str(local_path))
+            return local_path
+        except Exception as e:
+            logger.warning("从远程拷贝视频失败 task_id=%s: %s", task_id, e)
+            return None
+
     def _run_via_ssh_sync(self, task_id: str, cmd: str, log_file: str, task_type: str = 'reference_to_video') -> None:
         """同步执行：远程运行命令并等待完成（队列 worker 用）"""
         client = self._get_ssh_client()
@@ -309,8 +376,10 @@ class RemoteVideoGeneratorService:
         stdin, stdout, stderr = client.exec_command(sync_cmd, timeout=7200)
         stdout.read()
         exit_status = stdout.channel.recv_exit_status()
+        notify_url = (getattr(settings, 'VIDEO_CREATE_NOTIFY_URL', '') or '').strip()
         if exit_status != 0:
-            logger.warning("视频生成 task_id=%s 退出码: %s", task_id, exit_status)
+            _exit_desc = _get_exit_code_desc(exit_status)
+            logger.warning("视频生成 task_id=%s 退出码: %s（%s）", task_id, exit_status, _exit_desc)
             extra = ""
             try:
                 tail_cmd = f"tail -200 {log_file} 2>/dev/null || cat {log_file} 2>/dev/null"
@@ -318,15 +387,31 @@ class RemoteVideoGeneratorService:
                 extra = stdout2.read().decode(errors='replace')
             except Exception:
                 pass
-            _write_failed_log(task_id, f"远程脚本退出码 {exit_status}", extra)
+            _write_failed_log(
+                task_id,
+                f"远程脚本退出码 {exit_status}，{_exit_desc}。详细错误见下方日志（远程: {log_file}）",
+                extra,
+            )
+            if notify_url:
+                call_notify(notify_url, task_id, "", "FAIL")
         elif not self._check_mp4_exists_ssh(client, task_id, task_type):
             _write_failed_log(
                 task_id,
                 f"脚本退出码 0 但未找到 {task_id}.mp4（路径: {self._get_result_dir(task_type)}）",
                 "请检查 generate_video.py 的输出目录配置",
             )
+            if notify_url:
+                call_notify(notify_url, task_id, "", "FAIL")
         else:
             logger.info("视频生成完成 task_id=%s", task_id)
+            oss_url = ""
+            local_path = self._copy_task_mp4_from_remote(client, task_id, task_type)
+            if local_path:
+                prefix = getattr(settings, 'OSS_CREATE_PREFIX', 'generated/')
+                log_path = getattr(settings, 'OSS_CREATE_URL_LOG_PATH', '')
+                oss_url = _upload_video_to_cos_and_log(local_path, task_id, prefix, log_path)
+            if notify_url:
+                call_notify(notify_url, task_id, oss_url or "", "SUCCESS" if oss_url else "FAIL")
 
     def _run_local_sync(self, task_id: str, cmd: str, log_file: str, task_type: str = 'reference_to_video') -> None:
         """同步执行：本机运行命令并等待完成（队列 worker 用）"""
@@ -339,8 +424,10 @@ class RemoteVideoGeneratorService:
                 cwd='/',
                 timeout=7200,
             )
+        notify_url = (getattr(settings, 'VIDEO_CREATE_NOTIFY_URL', '') or '').strip()
         if result.returncode != 0:
-            logger.warning("视频生成 task_id=%s 退出码: %s", task_id, result.returncode)
+            _exit_desc = _get_exit_code_desc(result.returncode)
+            logger.warning("视频生成 task_id=%s 退出码: %s（%s）", task_id, result.returncode, _exit_desc)
             extra = ""
             try:
                 p = Path(log_file)
@@ -350,15 +437,32 @@ class RemoteVideoGeneratorService:
                         extra = content[-20000:]
             except Exception:
                 pass
-            _write_failed_log(task_id, f"本机脚本退出码 {result.returncode}", extra)
+            _write_failed_log(
+                task_id,
+                f"本机脚本退出码 {result.returncode}，{_exit_desc}。详细错误见下方日志（{log_file}）",
+                extra,
+            )
+            if notify_url:
+                call_notify(notify_url, task_id, "", "FAIL")
         elif not self._check_mp4_exists_local(task_id, task_type):
             _write_failed_log(
                 task_id,
                 f"脚本退出码 0 但未找到 {task_id}.mp4（路径: {self._get_result_dir(task_type)}）",
                 "请检查 generate_video.py 的输出目录配置",
             )
+            if notify_url:
+                call_notify(notify_url, task_id, "", "FAIL")
         else:
             logger.info("视频生成完成 task_id=%s", task_id)
+            oss_url = ""
+            result_dir = self._get_result_dir(task_type)
+            if result_dir:
+                local_path = Path(result_dir) / f"{task_id}.mp4"
+                prefix = getattr(settings, 'OSS_CREATE_PREFIX', 'generated/')
+                log_path = getattr(settings, 'OSS_CREATE_URL_LOG_PATH', '')
+                oss_url = _upload_video_to_cos_and_log(local_path, task_id, prefix, log_path)
+            if notify_url:
+                call_notify(notify_url, task_id, oss_url or "", "SUCCESS" if oss_url else "FAIL")
 
     def _submit_via_ssh(self, task_id: str, cmd: str, log_file: str, _context: str = "") -> dict:
         """通过 SSH 在远程执行"""

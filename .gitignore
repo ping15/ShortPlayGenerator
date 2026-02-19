@@ -7,3 +7,5 @@ generated_videos/
 .idea/
 test_assets
 env.example
+ShortPlayGenerator.env
+scripts

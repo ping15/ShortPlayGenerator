@@ -5,15 +5,18 @@ import base64
 import json
 import logging
 import os
+import re
 import subprocess
+import tempfile
 import traceback
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
 from threading import Lock, Thread
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import paramiko
+import requests
 from scp import SCPClient
 
 from django.conf import settings
@@ -151,6 +154,109 @@ def _write_failed_log(task_id: str, reason: str, extra: str = "") -> None:
 def _escape_shell_arg(s: str) -> str:
     """转义 shell 参数字符串，避免注入和解析错误"""
     return s.replace("\\", "\\\\").replace("'", "'\\''")
+
+
+def _get_ref_imgs_dir() -> str:
+    """ref_imgs 缓存目录（与 generate_video.py 运行目录一致）"""
+    work_dir = getattr(settings, 'REMOTE_WORK_DIR', '/root/autodl-tmp/SkyReels-V3')
+    return f"{work_dir.rstrip('/')}/ref_imgs"
+
+
+def _resolve_ref_imgs_download(
+    task_id: str,
+    ref_imgs_str: str,
+    use_remote_ssh: bool,
+    ssh_client: Optional[paramiko.SSHClient] = None,
+) -> str:
+    """
+    将 ref_imgs 中的 http(s) URL 下载为短文件名，避免 SkyReels maybe_download 因文件名超 255 字符报错。
+    返回逗号分隔的本地/远程路径，供 generate_video.py --ref_imgs 使用。
+    """
+    if not ref_imgs_str or not ref_imgs_str.strip():
+        return ref_imgs_str
+
+    refs_dir = _get_ref_imgs_dir()
+    resolved: List[str] = []
+    to_scp: List[Tuple[str, str]] = []  # (local_path, remote_path)
+
+    for i, raw in enumerate(re.split(r",\s*", ref_imgs_str.strip())):
+        raw = raw.strip()
+        if not raw:
+            continue
+        # 已是本地路径 (file:// 或 绝对路径)
+        if raw.lower().startswith("file://"):
+            path = raw[7:] if raw[7:8] == "/" else raw[8:]  # file:///path -> /path
+            resolved.append(path)
+            continue
+        if raw.startswith("/") and "://" not in raw:
+            resolved.append(raw)
+            continue
+        # http(s) URL：下载到短文件名
+        if raw.lower().startswith(("http://", "https://")):
+            # 从 URL 取扩展名（? 之前）
+            path_part = raw.split("?")[0]
+            ext = Path(path_part).suffix or ".jpeg"
+            ext = ext[:10] if len(ext) > 10 else ext  # 防异常过长
+            safe_ext = ext if re.match(r"^\.[a-zA-Z0-9]+$", ext) else ".jpeg"
+            short_name = f"{task_id}_{i}{safe_ext}"
+            remote_path = f"{refs_dir}/{short_name}"
+
+            if use_remote_ssh:
+                # 下载到本地临时文件，稍后 SCP 到远程
+                local_fd, local_path = tempfile.mkstemp(suffix=safe_ext, prefix=f"ref_{task_id}_")
+                try:
+                    os.close(local_fd)
+                    resp = requests.get(raw, timeout=60)
+                    resp.raise_for_status()
+                    with open(local_path, "wb") as f:
+                        f.write(resp.content)
+                    to_scp.append((local_path, remote_path))
+                    resolved.append(remote_path)
+                except Exception as e:
+                    logger.warning("下载 ref_imgs URL 失败 task_id=%s i=%s: %s", task_id, i, e)
+                    resolved.append(raw)  # 回退为原始 URL
+                    if os.path.exists(local_path):
+                        try:
+                            os.unlink(local_path)
+                        except OSError:
+                            pass
+            else:
+                # 本机模式：直接下载到 ref_imgs 目录
+                Path(refs_dir).mkdir(parents=True, exist_ok=True)
+                local_path = f"{refs_dir}/{short_name}"
+                try:
+                    resp = requests.get(raw, timeout=60)
+                    resp.raise_for_status()
+                    with open(local_path, "wb") as f:
+                        f.write(resp.content)
+                    resolved.append(local_path)
+                except Exception as e:
+                    logger.warning("下载 ref_imgs URL 失败 task_id=%s i=%s: %s", task_id, i, e)
+                    resolved.append(raw)
+        else:
+            resolved.append(raw)
+
+    # 远程模式：SCP 上传
+    if use_remote_ssh and ssh_client and to_scp:
+        try:
+            with SCPClient(ssh_client.get_transport()) as scp:
+                for local_path, remote_path in to_scp:
+                    remote_dir = str(Path(remote_path).parent)
+                    # 确保远程目录存在
+                    stdin, stdout, _ = ssh_client.exec_command(f"mkdir -p {repr(remote_dir)}", timeout=10)
+                    stdout.channel.recv_exit_status()
+                    scp.put(local_path, remote_path)
+        except Exception as e:
+            logger.exception("SCP ref_imgs 到远程失败 task_id=%s: %s", task_id, e)
+        finally:
+            for local_path, _ in to_scp:
+                if os.path.exists(local_path):
+                    try:
+                        os.unlink(local_path)
+                    except OSError:
+                        pass
+
+    return ",".join(resolved)
 
 
 class RemoteVideoGeneratorService:
@@ -570,6 +676,16 @@ def _video_gen_worker():
         task_id, kwargs = item
         try:
             task_type = kwargs.get('task_type', 'reference_to_video')
+            # reference_to_video 时，将长 URL 的 ref_imgs 预下载到短文件名，避免 SkyReels 文件名超 255 字符
+            if task_type == 'reference_to_video':
+                ref_imgs_raw = kwargs.get('ref_imgs', '')
+                if ref_imgs_raw:
+                    use_remote = video_generator_service._use_remote_ssh()
+                    ssh_client = video_generator_service._get_ssh_client() if use_remote else None
+                    resolved = _resolve_ref_imgs_download(
+                        task_id, ref_imgs_raw, use_remote, ssh_client
+                    )
+                    kwargs = {**kwargs, 'ref_imgs': resolved}
             cmd = video_generator_service._build_command_safe(task_id, **kwargs)
             log_file = f"/tmp/skyreels_{task_id}.log"
             if video_generator_service._use_remote_ssh():

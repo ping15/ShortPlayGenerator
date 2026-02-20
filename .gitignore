@@ -9,3 +9,4 @@ test_assets
 env.example
 ShortPlayGenerator.env
 scripts
+start_gunicorn.sh

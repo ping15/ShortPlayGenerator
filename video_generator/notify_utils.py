@@ -30,7 +30,10 @@ def call_notify(url: str, task_id: str, video_url: str, status: str) -> bool:
             timeout=30,
         )
         ok = resp.status_code == 200
-        if not ok:
+        if ok:
+            print("通知接口200成功 taskId=%s url=%s status=%s videoUrl=%s", task_id, url, status, video_url or "")
+            logger.info("通知接口200成功 taskId=%s url=%s status=%s videoUrl=%s", task_id, url, status, video_url or "")
+        else:
             logger.warning("通知接口非200 taskId=%s url=%s status=%s videoUrl=%s", task_id, url, resp.status_code, video_url or "")
         return ok
     except Exception as e:

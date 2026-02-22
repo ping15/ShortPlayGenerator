@@ -98,13 +98,24 @@ def _upload_video_to_cos_and_log(local_path: Path, task_id: str, prefix: str, lo
         return ""
     try:
         from qcloud_cos import CosConfig, CosS3Client
-        config = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key)
+        cos_timeout = getattr(settings, 'OSS_COS_TIMEOUT', 600)
+        cos_part_size = getattr(settings, 'OSS_COS_PART_SIZE', 1)
+        cos_max_thread = getattr(settings, 'OSS_COS_MAX_THREAD', 1)
+        config = CosConfig(
+            Region=region,
+            SecretId=secret_id,
+            SecretKey=secret_key,
+            Timeout=cos_timeout,
+        )
         client = CosS3Client(config)
         object_key = f"{prefix.rstrip('/')}/{task_id}.mp4"
         client.upload_file(
             Bucket=bucket_name,
             LocalFilePath=str(local_path),
             Key=object_key,
+            PartSize=cos_part_size,
+            MAXThread=cos_max_thread,
+            EnableMD5=False,
         )
         oss_url = f"https://{bucket_name}.cos.{region}.myqcloud.com/{object_key}"
         logger.info("视频生成 COS上传成功 task_id=%s url=%s", task_id, oss_url)

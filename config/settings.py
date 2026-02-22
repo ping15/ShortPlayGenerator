@@ -148,6 +148,13 @@ OSS_CREATE_PREFIX = os.environ.get('OSS_CREATE_PREFIX', 'generated/')
 OSS_URL_LOG_PATH = os.environ.get('OSS_URL_LOG_PATH') or str(BASE_DIR / 'test_assets' / 'logs' / 'merged_oss_urls.log')
 OSS_CREATE_URL_LOG_PATH = os.environ.get('OSS_CREATE_URL_LOG_PATH') or str(BASE_DIR / 'test_assets' / 'logs' / 'video_create_oss_urls.log')
 
+# COS 请求超时时间（秒），带宽较小时可增大以减少分片超时，默认 600（10 分钟）
+OSS_COS_TIMEOUT = int(os.environ.get('OSS_COS_TIMEOUT', '600'))
+# 分片大小（MB），低带宽建议 1
+OSS_COS_PART_SIZE = int(os.environ.get('OSS_COS_PART_SIZE', '1'))
+# 并发线程数，低带宽建议 1 避免多线程抢占
+OSS_COS_MAX_THREAD = int(os.environ.get('OSS_COS_MAX_THREAD', '1'))
+
 # 任务完成后的 HTTP 通知地址（POST JSON，有值则调用）
 MERGE_NOTIFY_URL = os.environ.get('MERGE_NOTIFY_URL', '')
 VIDEO_CREATE_NOTIFY_URL = os.environ.get('VIDEO_CREATE_NOTIFY_URL', '')

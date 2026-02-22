@@ -128,14 +128,36 @@ def _merge_videos_sync(task_id: str, video_urls: list) -> None:
     if secret_id and secret_key and bucket_name:
         try:
             from qcloud_cos import CosConfig, CosS3Client
-            config = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key)
+            cos_timeout = getattr(settings, 'OSS_COS_TIMEOUT', 600)
+            cos_part_size = getattr(settings, 'OSS_COS_PART_SIZE', 1)
+            cos_max_thread = getattr(settings, 'OSS_COS_MAX_THREAD', 1)
+            config = CosConfig(
+                Region=region,
+                SecretId=secret_id,
+                SecretKey=secret_key,
+                Timeout=cos_timeout,
+            )
             client = CosS3Client(config)
             object_key = f"{prefix.rstrip('/')}/{task_id}.mp4"
-            client.upload_file(
-                Bucket=bucket_name,
-                LocalFilePath=str(out_path),
-                Key=object_key,
-            )
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    client.upload_file(
+                        Bucket=bucket_name,
+                        LocalFilePath=str(out_path),
+                        Key=object_key,
+                        PartSize=cos_part_size,
+                        MAXThread=cos_max_thread,
+                        EnableMD5=False,
+                    )
+                    break
+                except Exception as upload_err:
+                    if attempt < max_retries - 1:
+                        wait_sec = 5 * (attempt + 1)
+                        logger.warning("COS上传重试 taskId=%s 第%d次失败，%ds后重试: %s", task_id, attempt + 1, wait_sec, upload_err)
+                        time.sleep(wait_sec)
+                    else:
+                        raise
             oss_url = f"https://{bucket_name}.cos.{region}.myqcloud.com/{object_key}"
             logger.info("COS上传成功 taskId=%s url=%s", task_id, oss_url)
         except Exception as e:
